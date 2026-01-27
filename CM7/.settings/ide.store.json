@@ -1,0 +1,6 @@
+{
+  "device": "STM32H755ZIT6",
+  "core": "Cortex-M7",
+  "order": 1,
+  "toolchain": "GCC"
+}

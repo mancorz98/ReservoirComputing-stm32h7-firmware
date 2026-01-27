@@ -1,0 +1,22 @@
+{
+  "configurations": [
+    {
+      "name": "test",
+      "type": "stlinkgdbtarget",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "preBuild": "${command:st-stm32-ide-debug-launch.build}",
+      "runEntry": "main",
+      "imagesAndSymbols": [
+        {
+          "imageFileName": "${workspaceFolder}/CM7/build/test_vscode_CM7.elf"
+        }
+      ],
+      "verbose": false,
+      "liveWatch": {
+        "enabled": true,
+        "samplesPerSecond": "4"
+      }
+    }
+  ]
+}
