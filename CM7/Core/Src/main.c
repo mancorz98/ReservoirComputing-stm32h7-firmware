@@ -18,7 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "stm32h7xx_hal_tim.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -73,7 +72,7 @@
 
 #define DAC_REF_VOLTAGE_V 2.5f
 #define ADC_REF_VOLTAGE_V 3.3f
-#define PULSE_AMPLITUDE_V 1.5f
+#define PULSE_AMPLITUDE_V 1.0f
 
 #define DAC_PERIOD_S (1.0f / TIMER1_FREQ_HZ) // 0.001s = 1ms
 #define SUPPLY_PERIOD_MS 10.0f               // 10ms
@@ -151,7 +150,7 @@ volatile uint8_t callback_count = 0;
 const uint8_t channels[8] = {CHANNEL_A, CHANNEL_B, CHANNEL_C, CHANNEL_D,
                              CHANNEL_E, CHANNEL_F, CHANNEL_G, CHANNEL_H};
 const float adc_period = 1.0f / (float)TIMER8_FREQ_HZ;
-const float dac_period = 1.0f / (float)TIMER1_FREQ_HZ;
+const float dac_period = DAC_PERIOD_S;
 
 static const float supply_period = SUPPLY_PERIOD_S;
 static const size_t total_supply_cycles = TOTAL_SUPPLY_CYCLES;
@@ -163,8 +162,8 @@ static DACValueCommand dac_values_timed[EXPECTED_SAMPLES_PER_ROW];
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MPU_Config(void);
-static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
+static void MX_GPIO_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_TIM8_Init(void);
 static void MX_SPI1_Init(void);
@@ -691,8 +690,7 @@ void USB_RXCallback(uint8_t *buf, uint32_t len) {
 void process_image(uint8_t image[IMAGE_SIZE][IMAGE_SIZE]) {
   static DACValueCommand
       dac_values[IMAGE_SIZE * 10]; // Static to avoid stack overflow
-  size_t out_size =
-      IMAGE_SIZE * (size_t)(TIMER1_FREQ_HZ * supply_period); // 100ms
+  size_t out_size = IMAGE_SIZE * TOTAL_SUPPLY_CYCLES; // 100ms
 
   // Generate waveforms for all rows
   for (size_t i = 0; i < IMAGE_SIZE; i++) {
@@ -912,19 +910,23 @@ int main(void) {
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
-  MX_GPIO_Init();
   MX_DMA_Init();
+  MX_GPIO_Init();
   MX_ADC2_Init();
   MX_TIM8_Init();
   MX_SPI1_Init();
   MX_TIM1_Init();
-  MX_USB_DEVICE_Init();
   MX_TIM3_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   // HAL_SYSCFG_EnableVREFBUF();
 
-  HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET_LINEARITY,
-                              ADC_SINGLE_ENDED);
+  // HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET_LINEARITY,
+  //                             ADC_SINGLE_ENDED);
+
+  // // while (HAL_ADCEx_Calibration_GetValue(&hadc2, ADC_SINGLE_ENDED) !=
+  // HAL_OK)
+  // //   ;
 
   // HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_FACTOR_LINEARITY_REGOFFSET,
   //                             ADC_SINGLE_ENDED);
@@ -940,8 +942,23 @@ int main(void) {
   //   HAL_ADCEx_Calibration_SetValue(&hadc2, ADC_SINGLE_ENDED, calibFactor);
   // }
 
-  HAL_ADC_Start_DMA(&hadc2, (uint32_t *)ADC_VAL,
-                    ADC_NUM_CONVERSIONS * READOUT_SAMPLES);
+  // HAL_ADC_Start_DMA(&hadc2, (uint32_t *)ADC_VAL,
+  //                   ADC_NUM_CONVERSIONS * READOUT_SAMPLES);
+
+  // 1. Run the most comprehensive calibration (Offset + Linearity)
+  // We wrap it in an if statement to catch hardware failures
+  if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET_LINEARITY,
+                                  ADC_SINGLE_ENDED) != HAL_OK) {
+    // Calibration failed. Insert your error handling here.
+    Error_Handler();
+  }
+
+  // 2. Start the ADC in DMA mode
+  if (HAL_ADC_Start_DMA(&hadc2, (uint32_t *)ADC_VAL,
+                        ADC_NUM_CONVERSIONS * READOUT_SAMPLES) != HAL_OK) {
+    // DMA Start failed. Insert your error handling here.
+    Error_Handler();
+  }
 
   // HAL_TIM_Base_Start_IT(&htim8); // Start timer for ADC triggering
 
@@ -970,7 +987,7 @@ int main(void) {
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  // Disable internal reference (use external 3.3V)
+  // Disable internal reference (use internal 2V)
   TX_buffer[0] = 0x07000000;
   HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 100); // CS automatic!
   HAL_Delay(1);
@@ -984,7 +1001,7 @@ int main(void) {
   cmd.control = CMD_WRITE_UPDATE_ALL;
   cmd.feature = FEATURE_NO_OPERATION;
   cmd.channel = CHANNEL_ALL;
-  cmd.data = 0x8000; // Set all channels to midscale
+  cmd.data = 0x0; // Set all channels to midscale
   TX_buffer[0] = set_command_word(&cmd);
   HAL_SPI_Transmit_DMA(&hspi1, (uint8_t *)TX_buffer, 1);
   HAL_Delay(10);
@@ -1113,7 +1130,7 @@ static void MX_ADC2_Init(void) {
    */
   sConfig.Channel = ADC_CHANNEL_3;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_16CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_32CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
@@ -1124,7 +1141,7 @@ static void MX_ADC2_Init(void) {
 
   /** Configure Regular Channel
    */
-  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Channel = ADC_CHANNEL_5;
   sConfig.Rank = ADC_REGULAR_RANK_2;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
     Error_Handler();
@@ -1132,7 +1149,7 @@ static void MX_ADC2_Init(void) {
 
   /** Configure Regular Channel
    */
-  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Channel = ADC_CHANNEL_6;
   sConfig.Rank = ADC_REGULAR_RANK_3;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
     Error_Handler();
@@ -1140,7 +1157,7 @@ static void MX_ADC2_Init(void) {
 
   /** Configure Regular Channel
    */
-  sConfig.Channel = ADC_CHANNEL_6;
+  sConfig.Channel = ADC_CHANNEL_10;
   sConfig.Rank = ADC_REGULAR_RANK_4;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
     Error_Handler();
@@ -1148,7 +1165,7 @@ static void MX_ADC2_Init(void) {
 
   /** Configure Regular Channel
    */
-  sConfig.Channel = ADC_CHANNEL_7;
+  sConfig.Channel = ADC_CHANNEL_14;
   sConfig.Rank = ADC_REGULAR_RANK_5;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
     Error_Handler();
@@ -1156,7 +1173,7 @@ static void MX_ADC2_Init(void) {
 
   /** Configure Regular Channel
    */
-  sConfig.Channel = ADC_CHANNEL_10;
+  sConfig.Channel = ADC_CHANNEL_15;
   sConfig.Rank = ADC_REGULAR_RANK_6;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
     Error_Handler();
@@ -1164,7 +1181,7 @@ static void MX_ADC2_Init(void) {
 
   /** Configure Regular Channel
    */
-  sConfig.Channel = ADC_CHANNEL_15;
+  sConfig.Channel = ADC_CHANNEL_18;
   sConfig.Rank = ADC_REGULAR_RANK_7;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
     Error_Handler();
@@ -1172,7 +1189,7 @@ static void MX_ADC2_Init(void) {
 
   /** Configure Regular Channel
    */
-  sConfig.Channel = ADC_CHANNEL_18;
+  sConfig.Channel = ADC_CHANNEL_19;
   sConfig.Rank = ADC_REGULAR_RANK_8;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
     Error_Handler();
@@ -1290,7 +1307,7 @@ static void MX_TIM3_Init(void) {
 
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 64 - 1;
+  htim3.Init.Prescaler = 640 - 1;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim3.Init.Period = 1000 - 1;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -1392,7 +1409,6 @@ static void MX_DMA_Init(void) {
  * @retval None
  */
 static void MX_GPIO_Init(void) {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -1402,19 +1418,8 @@ static void MX_GPIO_Init(void) {
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
-  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin : CS_Pin */
-  GPIO_InitStruct.Pin = CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
-  HAL_GPIO_Init(CS_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
