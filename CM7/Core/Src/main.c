@@ -64,8 +64,8 @@
 #define BUFF_MULTIPLY 8
 #define IMAGE_SIZE 8
 #define EXPECTED_PACKET_SIZE 71
-#define READOUT_VOLTAGE_V 0.15f
-#define READOUT_SAMPLES 100
+#define READOUT_VOLTAGE_V 0.25f
+#define READOUT_SAMPLES 150
 
 #define APB_CLOCK_HZ 65000000U
 #define TIMER8_FREQ_HZ 100000U // 100kHz ADC trigger
@@ -73,7 +73,7 @@
 
 #define DAC_REF_VOLTAGE_V 2.5f
 #define ADC_REF_VOLTAGE_V 3.3f
-#define PULSE_AMPLITUDE_V 1.5f
+#define PULSE_AMPLITUDE_V 2.25f
 
 #define DAC_PERIOD_S (1.0f / TIMER1_FREQ_HZ) // 0.001s = 1ms
 #define SUPPLY_PERIOD_MS 1.0f                // 10ms
@@ -84,6 +84,8 @@
   ((size_t)(TIMER1_FREQ_HZ * SUPPLY_PERIOD_S)) // 10 cycles
 #define EXPECTED_SAMPLES_PER_ROW                                               \
   (IMAGE_SIZE * TOTAL_SUPPLY_CYCLES) // 100 samples
+
+#define DAC_BATCH_SIZE 9 // 8 channel writes + 1 update command
 
 /* USER CODE END PM */
 
@@ -181,7 +183,14 @@ volatile uint8_t dac_ready = 1; // ← CRITICAL: Add this!
 __attribute__((section(
     ".adcarray"))) uint16_t ADC_VAL[ADC_NUM_CONVERSIONS * READOUT_SAMPLES];
 
+__attribute__((
+    section(".adcarray"))) uint32_t TX_batch_buffer[DAC_BATCH_SIZE] = {0};
+
+/* Keep single-word buffer for non-batch operations (readout, zeroing) */
 __attribute__((section(".adcarray"))) uint32_t TX_buffer[1] = {0};
+
+/* DMA completion flag */
+volatile uint8_t spi_dma_complete = 0;
 
 volatile float value[ADC_NUM_CONVERSIONS];
 int count = 0;
@@ -209,6 +218,29 @@ uint16_t get_channel_value(volatile DACValueCommand *dac_val, uint8_t ch) {
   }
 }
 
+/**
+ * @brief Fill TX_batch_buffer with 8 channel writes + 1 update command
+ * @param dac_val Pointer to current pixel's DACValueCommand
+ */
+void Build_DAC_Batch(volatile DACValueCommand *dac_val) {
+  DACcommand cmd;
+  cmd.feature = FEATURE_NO_OPERATION;
+
+  // 8 channel WRITE commands
+  for (uint8_t ch = 0; ch < 8; ch++) {
+    cmd.control = CMD_WRITE;
+    cmd.channel = channels[ch];
+    cmd.data = get_channel_value(dac_val, ch);
+    TX_batch_buffer[ch] = set_command_word(&cmd);
+  }
+
+  // UPDATE ALL command (index 8)
+  cmd.control = CMD_UPDATE;
+  cmd.channel = CHANNEL_ALL;
+  cmd.data = 0;
+  TX_batch_buffer[8] = set_command_word(&cmd);
+}
+
 long map(long x, long in_min, long in_max, long out_min, long out_max) {
   // Clamp input to valid range
   if (x < in_min)
@@ -232,6 +264,19 @@ float mapf(long x, long in_min, long in_max, float out_min, float out_max) {
   // Calculate with float precision
   return (float)(x - in_min) * (out_max - out_min) / (in_max - in_min) +
          out_min;
+}
+
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
+  if (hspi != &hspi1)
+    return;
+
+  if (dac_state == DAC_STATE_READOUT_INIT) {
+    // Readout pulse sent — start ADC sampling
+    dac_state = DAC_STATE_READOUT_ACTIVE;
+    __HAL_TIM_SET_COUNTER(&htim8, 0);
+    __HAL_TIM_CLEAR_FLAG(&htim8, TIM_FLAG_UPDATE);
+    HAL_TIM_Base_Start(&htim8);
+  }
 }
 
 size_t create_csv_record(char *buffer, size_t buffer_size,
@@ -393,7 +438,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
     cmd.channel = CHANNEL_ALL;
     cmd.data = 0x0000;
     TX_buffer[0] = set_command_word(&cmd);
-    HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
+    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t *)TX_buffer, 1);
 
     dac_state = DAC_STATE_COMPLETE;
     readout_complete = 1;
@@ -458,30 +503,33 @@ void Send_Readout_Pulse_Continue(void) {
 void Start_Readout_Phase(void) {
   readout_complete = 0;
 
-  // Send readout voltage to all channels - BLOCKING
   uint16_t readout_dac_value =
       (uint16_t)(READOUT_VOLTAGE_V / DAC_REF_VOLTAGE_V * 65535.0f);
 
   DACcommand cmd;
+  cmd.feature = FEATURE_NO_OPERATION;
+
   for (uint8_t ch = 0; ch < 8; ch++) {
     cmd.control = CMD_WRITE;
-    cmd.feature = FEATURE_NO_OPERATION;
     cmd.channel = channels[ch];
     cmd.data = readout_dac_value;
-    TX_buffer[0] = set_command_word(&cmd);
-    HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
+    TX_batch_buffer[ch] = set_command_word(&cmd);
   }
 
-  // Update all channels simultaneously
   cmd.control = CMD_UPDATE;
   cmd.channel = CHANNEL_ALL;
   cmd.data = 0;
-  TX_buffer[0] = set_command_word(&cmd);
-  HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
+  TX_batch_buffer[8] = set_command_word(&cmd);
 
-  // Now start ADC sampling
-  dac_state = DAC_STATE_READOUT_ACTIVE;
-  HAL_TIM_Base_Start(&htim8);
+  // Restart ADC DMA so buffer starts at index 0
+  HAL_ADC_Stop_DMA(&hadc2);
+  memset(ADC_VAL, 0, sizeof(ADC_VAL));
+  HAL_ADC_Start_DMA(&hadc2, (uint32_t *)ADC_VAL,
+                    ADC_NUM_CONVERSIONS * READOUT_SAMPLES);
+
+  // Send via DMA — callback will start TIM8
+  dac_state = DAC_STATE_READOUT_INIT;
+  HAL_SPI_Transmit_DMA(&hspi1, (uint8_t *)TX_batch_buffer, DAC_BATCH_SIZE);
 }
 
 HAL_StatusTypeDef DAC_Start_Update(DACValueCommand *dac_values,
@@ -539,27 +587,25 @@ HAL_StatusTypeDef DAC_Start_Timer_Sequence(DACValueCommand *dac_values,
   return HAL_OK;
 }
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+  if (htim->Instance == TIM3) {
+    __HAL_TIM_CLEAR_FLAG(htim, TIM_FLAG_UPDATE);
+    return;
+  }
+
   if (htim->Instance != TIM1)
     return;
 
   if (current_pixel < total_pixels) {
-    DACcommand cmd;
-    for (uint8_t ch = 0; ch < 8; ch++) {
-      cmd.control = CMD_WRITE;
-      cmd.feature = FEATURE_NO_OPERATION;
-      cmd.channel = channels[ch];
-      cmd.data = get_channel_value(&current_dac_values[current_pixel], ch);
-      TX_buffer[0] = set_command_word(&cmd);
-      HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
-    }
-    cmd.control = CMD_UPDATE;
-    cmd.channel = CHANNEL_ALL;
-    cmd.data = 0;
-    TX_buffer[0] = set_command_word(&cmd);
-    HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
+    // Build the 9-word batch for this pixel
+    Build_DAC_Batch(&current_dac_values[current_pixel]);
+
+    // Send all 9 words via single DMA transfer
+    // NSSP mode auto-pulses CS between each 32-bit frame
+    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t *)TX_batch_buffer, DAC_BATCH_SIZE);
 
     current_pixel++;
   } else {
+    // Programming done → start readout
     HAL_TIM_Base_Stop_IT(&htim1);
     dac_state = DAC_STATE_WRITE_COMPLETE;
     Start_Readout_Phase();
@@ -1177,15 +1223,15 @@ static void MX_SPI1_Init(void) {
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi1.Init.CRCPolynomial = 0x0;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
   hspi1.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
   hspi1.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
   hspi1.Init.TxCRCInitializationPattern =
       SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
   hspi1.Init.RxCRCInitializationPattern =
       SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
-  hspi1.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
-  hspi1.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi1.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_02CYCLE;
+  hspi1.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_02CYCLE;
   hspi1.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
   hspi1.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
   hspi1.Init.IOSwap = SPI_IO_SWAP_DISABLE;
@@ -1235,7 +1281,7 @@ static void MX_TIM1_Init(void) {
     Error_Handler();
   }
   /* USER CODE BEGIN TIM1_Init 2 */
-
+  HAL_NVIC_SetPriority(TIM1_UP_IRQn, 2, 0); // TIM1 — lower than DMA
   /* USER CODE END TIM1_Init 2 */
 }
 
