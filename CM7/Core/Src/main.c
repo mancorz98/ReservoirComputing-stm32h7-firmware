@@ -68,14 +68,14 @@
 
 #define APB_CLOCK_HZ 65000000U
 #define TIMER8_FREQ_HZ 100000U // 100kHz ADC trigger
-#define TIMER1_FREQ_HZ 1000U   // 1kHz DAC trigger
+#define TIMER1_FREQ_HZ 4000U   // 1kHz DAC trigger
 
 #define DAC_REF_VOLTAGE_V 2.5f
 #define ADC_REF_VOLTAGE_V 3.3f
 #define PULSE_AMPLITUDE_V 1.0f
 
 #define DAC_PERIOD_S (1.0f / TIMER1_FREQ_HZ) // 0.001s = 1ms
-#define SUPPLY_PERIOD_MS 10.0f               // 10ms
+#define SUPPLY_PERIOD_MS 1.0f                // 10ms
 
 // Calculate compile-time constants
 #define SUPPLY_PERIOD_S (SUPPLY_PERIOD_MS / 1000.0f) // 0.01s
@@ -1266,7 +1266,7 @@ static void MX_TIM1_Init(void) {
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 64 - 1;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 1000 - 1;
+  htim1.Init.Period = 250 - 1;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -1399,7 +1399,7 @@ static void MX_DMA_Init(void) {
   HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 }
 
