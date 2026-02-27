@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32h7xx_hal_spi.h"
 #include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -72,7 +73,7 @@
 
 #define DAC_REF_VOLTAGE_V 2.5f
 #define ADC_REF_VOLTAGE_V 3.3f
-#define PULSE_AMPLITUDE_V 1.0f
+#define PULSE_AMPLITUDE_V 1.5f
 
 #define DAC_PERIOD_S (1.0f / TIMER1_FREQ_HZ) // 0.001s = 1ms
 #define SUPPLY_PERIOD_MS 1.0f                // 10ms
@@ -517,27 +518,26 @@ HAL_StatusTypeDef DAC_Start_Update(DACValueCommand *dac_values,
 
   return HAL_OK;
 }
-
 HAL_StatusTypeDef DAC_Start_Timer_Sequence(DACValueCommand *dac_values,
                                            size_t pixel_count) {
-  // ✅ Check if busy (allow IDLE or COMPLETE)
   if (dac_state != DAC_STATE_IDLE && dac_state != DAC_STATE_COMPLETE) {
     return HAL_BUSY;
   }
 
-  // Initialize state
   dac_state = DAC_STATE_WAITING_TIMER;
   current_channel = 0;
   current_pixel = 0;
   total_pixels = pixel_count;
   current_dac_values = dac_values;
 
-  // Start TIM1 with interrupt
+  // ✅ Reset counter to prevent immediate interrupt
+  __HAL_TIM_SET_COUNTER(&htim1, 0);
+  __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+
   HAL_TIM_Base_Start_IT(&htim1);
 
   return HAL_OK;
 }
-
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance != TIM1)
     return;
@@ -728,6 +728,7 @@ void process_image_timed(uint8_t image[IMAGE_SIZE][IMAGE_SIZE]) {
   HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
   __HAL_TIM_SET_COUNTER(&htim3, 0);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_Delay(10); // 10ms — safely past the 1ms active pulse
 
   if (DAC_Start_Timer_Sequence(dac_values_timed, out_size) != HAL_OK) {
     Error_Handler();
@@ -801,6 +802,7 @@ int main(void) {
        /* USER CODE END Boot_Mode_Sequence_0 */
 
   /* MPU Configuration--------------------------------------------------------*/
+
   MPU_Config();
 
   /* Enable the CPU Cache */
@@ -1175,7 +1177,7 @@ static void MX_SPI1_Init(void) {
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi1.Init.CRCPolynomial = 0x0;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
   hspi1.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
   hspi1.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
   hspi1.Init.TxCRCInitializationPattern =
