@@ -383,23 +383,18 @@ void Set_DAC_Outputs_Zero(void) {
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
   if (hadc != &hadc2)
     return;
-  callback_count++;
   if (dac_state == DAC_STATE_READOUT_ACTIVE) {
-    // ✅ Circular DMA complete = 100 scans done
-
-    // Just stop TIM8 (ADC keeps running but no new triggers)
     HAL_TIM_Base_Stop(&htim8);
 
-    // Zero DAC
+    // Zero DAC - blocking
     DACcommand cmd;
     cmd.control = CMD_WRITE_UPDATE_ALL;
     cmd.channel = CHANNEL_ALL;
     cmd.data = 0x0000;
-
     TX_buffer[0] = set_command_word(&cmd);
-    dac_state = DAC_STATE_ZEROING;
-    HAL_SPI_Transmit_DMA(&hspi1, (uint8_t *)TX_buffer, 1);
+    HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
 
+    dac_state = DAC_STATE_COMPLETE;
     readout_complete = 1;
   }
 }
@@ -459,75 +454,33 @@ void Send_Readout_Pulse_Continue(void) {
     readout_pulse_complete = 1;
   }
 }
-
 void Start_Readout_Phase(void) {
-  // Reset readout state
-  // readout_sample_count = 0;
   readout_complete = 0;
-  dac_state = DAC_STATE_READOUT_INIT;
 
-  // ✅ Start non-blocking readout pulse
-  Send_Readout_Pulse_Start();
-
-  // Rest will happen in SPI callback
-}
-void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi) {
-  if (hspi != &hspi1)
-    return;
+  // Send readout voltage to all channels - BLOCKING
+  uint16_t readout_dac_value =
+      (uint16_t)(READOUT_VOLTAGE_V / DAC_REF_VOLTAGE_V * 65535.0f);
 
   DACcommand cmd;
-
-  switch (dac_state) {
-
-  case DAC_STATE_SENDING_CHANNELS:
-    if (current_channel < 8) {
-      cmd.control = CMD_WRITE;
-      cmd.feature = FEATURE_NO_OPERATION;
-      cmd.channel = channels[current_channel];
-      cmd.data = get_channel_value(&current_dac_values[current_pixel],
-                                   current_channel);
-
-      TX_buffer[0] = set_command_word(&cmd);
-      HAL_SPI_Transmit_DMA(&hspi1, (uint8_t *)TX_buffer, 1);
-
-      current_channel++;
-    } else {
-      dac_state = DAC_STATE_SENDING_UPDATE;
-
-      cmd.control = CMD_UPDATE;
-      cmd.channel = CHANNEL_ALL;
-      cmd.feature = FEATURE_NO_OPERATION;
-      cmd.data = 0;
-
-      TX_buffer[0] = set_command_word(&cmd);
-      HAL_SPI_Transmit_DMA(&hspi1, (uint8_t *)TX_buffer, 1);
-    }
-    break;
-
-  case DAC_STATE_SENDING_UPDATE:
-    current_pixel++;
-    dac_state = DAC_STATE_WAITING_TIMER;
-    break;
-
-  case DAC_STATE_READOUT_INIT:
-    Send_Readout_Pulse_Continue();
-
-    if (readout_pulse_complete) {
-      // Start trigger
-      HAL_TIM_Base_Start(&htim8);
-
-      dac_state = DAC_STATE_READOUT_ACTIVE;
-    }
-    break;
-
-  case DAC_STATE_ZEROING: // ✅ Add this case
-    // Zero command complete
-    dac_state = DAC_STATE_COMPLETE;
-    break;
-
-  default:
-    break;
+  for (uint8_t ch = 0; ch < 8; ch++) {
+    cmd.control = CMD_WRITE;
+    cmd.feature = FEATURE_NO_OPERATION;
+    cmd.channel = channels[ch];
+    cmd.data = readout_dac_value;
+    TX_buffer[0] = set_command_word(&cmd);
+    HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
   }
+
+  // Update all channels simultaneously
+  cmd.control = CMD_UPDATE;
+  cmd.channel = CHANNEL_ALL;
+  cmd.data = 0;
+  TX_buffer[0] = set_command_word(&cmd);
+  HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
+
+  // Now start ADC sampling
+  dac_state = DAC_STATE_READOUT_ACTIVE;
+  HAL_TIM_Base_Start(&htim8);
 }
 
 HAL_StatusTypeDef DAC_Start_Update(DACValueCommand *dac_values,
@@ -586,34 +539,30 @@ HAL_StatusTypeDef DAC_Start_Timer_Sequence(DACValueCommand *dac_values,
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  __NOP();
+  if (htim->Instance != TIM1)
+    return;
 
-  if (htim->Instance == TIM1) {
-
-    if (dac_state == DAC_STATE_WAITING_TIMER) {
-
-      if (current_pixel < total_pixels) {
-        // Continue write phase
-        DACcommand cmd;
-        cmd.control = CMD_WRITE;
-        cmd.channel = CHANNEL_A;
-        cmd.data = get_channel_value(&current_dac_values[current_pixel], 0);
-
-        TX_buffer[0] = set_command_word(&cmd);
-        dac_state = DAC_STATE_SENDING_CHANNELS;
-        current_channel = 1;
-
-        HAL_SPI_Transmit_DMA(&hspi1, (uint8_t *)TX_buffer, 1);
-
-      } else {
-        // Write phase complete - transition to readout
-        HAL_TIM_Base_Stop_IT(&htim1);
-        dac_state = DAC_STATE_WRITE_COMPLETE;
-
-        // ✅ Start readout phase
-        Start_Readout_Phase();
-      }
+  if (current_pixel < total_pixels) {
+    DACcommand cmd;
+    for (uint8_t ch = 0; ch < 8; ch++) {
+      cmd.control = CMD_WRITE;
+      cmd.feature = FEATURE_NO_OPERATION;
+      cmd.channel = channels[ch];
+      cmd.data = get_channel_value(&current_dac_values[current_pixel], ch);
+      TX_buffer[0] = set_command_word(&cmd);
+      HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
     }
+    cmd.control = CMD_UPDATE;
+    cmd.channel = CHANNEL_ALL;
+    cmd.data = 0;
+    TX_buffer[0] = set_command_word(&cmd);
+    HAL_SPI_Transmit(&hspi1, (uint8_t *)TX_buffer, 1, 10);
+
+    current_pixel++;
+  } else {
+    HAL_TIM_Base_Stop_IT(&htim1);
+    dac_state = DAC_STATE_WRITE_COMPLETE;
+    Start_Readout_Phase();
   }
 }
 
