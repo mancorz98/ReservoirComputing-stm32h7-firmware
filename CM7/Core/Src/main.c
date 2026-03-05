@@ -646,13 +646,13 @@ void DAC_Reset(void) {
 }
 
 void USB_RXCallback(uint8_t *buf, uint32_t len) {
-  rx_callback_count++;
 
   // Catch the manual reset command (e.g., sending a single 'R')
   if (len == 1 && buf[0] == 'R') {
     manual_hw_reset_requested = 1;
     return; // Exit early so this doesn't corrupt your image accumulator
   }
+  rx_callback_count++;
 
   // Accumulate incoming data
   for (uint32_t i = 0; i < len && accum_len < USB_BUFFLEN; i++) {
