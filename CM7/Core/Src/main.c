@@ -160,6 +160,7 @@ static const size_t total_supply_cycles = TOTAL_SUPPLY_CYCLES;
 static const size_t expected_samples_per_row = EXPECTED_SAMPLES_PER_ROW;
 static DACValueCommand dac_values_timed[EXPECTED_SAMPLES_PER_ROW];
 
+volatile uint8_t manual_hw_reset_requested = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -647,6 +648,12 @@ void DAC_Reset(void) {
 void USB_RXCallback(uint8_t *buf, uint32_t len) {
   rx_callback_count++;
 
+  // Catch the manual reset command (e.g., sending a single 'R')
+  if (len == 1 && buf[0] == 'R') {
+    manual_hw_reset_requested = 1;
+    return; // Exit early so this doesn't corrupt your image accumulator
+  }
+
   // Accumulate incoming data
   for (uint32_t i = 0; i < len && accum_len < USB_BUFFLEN; i++) {
     accumulator[accum_len++] = buf[i];
@@ -733,6 +740,23 @@ void process_image(uint8_t image[IMAGE_SIZE][IMAGE_SIZE]) {
   // Function returns immediately!
   // DMA callback will handle everything
 }
+
+void Send_Hardware_Reset_Pulse(void) {
+  // Stop the timer to ensure a clean start
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+
+  // Reset the counter to 0
+  __HAL_TIM_SET_COUNTER(&htim3, 0);
+
+  // Start the PWM, which will output the active pulse defined by your duty
+  // cycle
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+
+  // 10ms — safely past the 1ms active pulse to prevent immediate overlapping
+  // commands
+  HAL_Delay(10);
+}
+
 void process_image_timed(uint8_t image[IMAGE_SIZE][IMAGE_SIZE]) {
   // ✅ Use the file-scope buffer instead of local static
   size_t out_size = EXPECTED_SAMPLES_PER_ROW;
@@ -771,10 +795,10 @@ void process_image_timed(uint8_t image[IMAGE_SIZE][IMAGE_SIZE]) {
   }
 
   readout_complete = 0;
-  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
-  __HAL_TIM_SET_COUNTER(&htim3, 0);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  HAL_Delay(10); // 10ms — safely past the 1ms active pulse
+  // HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+  // __HAL_TIM_SET_COUNTER(&htim3, 0);
+  // HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  // HAL_Delay(10); // 10ms — safely past the 1ms active pulse
 
   if (DAC_Start_Timer_Sequence(dac_values_timed, out_size) != HAL_OK) {
     Error_Handler();
@@ -1010,6 +1034,21 @@ int main(void) {
 
     /* USER CODE BEGIN 3 */
     process_usb_packet();
+
+    // Check if we received the 'R' command over USB
+    if (manual_hw_reset_requested) {
+      manual_hw_reset_requested = 0; // Clear the flag
+
+      // Optional: Only allow reset if the DAC isn't actively writing an image
+      if (!DAC_Is_Busy()) {
+        Send_Hardware_Reset_Pulse();
+
+        // Let the PC know it finished
+        uint8_t ack[] = "ACK_RST\r\n";
+        CDC_Transmit_FS(ack, 9);
+      }
+    }
+
     // Wait for complete cycle (write + readout)
     if (readout_complete) {
       // Can do other work here
