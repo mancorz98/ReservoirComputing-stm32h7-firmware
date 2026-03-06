@@ -767,7 +767,7 @@ void process_image_timed(uint8_t image[IMAGE_SIZE][IMAGE_SIZE]) {
 
     uint16_t *dac_waveform = generate_dac_waveform(
         image[row], IMAGE_SIZE, DAC_REF_VOLTAGE_V, PULSE_AMPLITUDE_V,
-        TIMER1_FREQ_HZ, supply_period, 0.5f, &actual_samples);
+        TIMER1_FREQ_HZ, supply_period, 0.75f, &actual_samples);
 
     if (dac_waveform == NULL) {
       Error_Handler();
